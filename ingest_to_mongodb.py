@@ -32,12 +32,12 @@ MONGO_URI = os.getenv("MONGODB_URI")
 DB_NAME = os.getenv("MONGODB_DBNAME", "gpt_integration")
 COLLECTION_NAME = os.getenv("MONGODB_COLLECTION", "documents")
 
-# GCP
+# GCP Configuration
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
-GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
+GCS_BUCKET_NAME = "gcp-rag-data-bucket"  # fixed as per requirement
 GCS_KEY_PATH = os.getenv("GCS_KEY_PATH")
-GCS_INPUT_PREFIX = os.getenv("GCS_INPUT_PREFIX", "pdfs/")
-GCS_OUTPUT_PREFIX = os.getenv("GCS_OUTPUT_PREFIX", "knowledge_pack/")
+GCS_INPUT_PREFIX = "pdfs/"
+GCS_OUTPUT_PREFIX = "knowledge_pack/"
 LOCAL_TMP_DIR = os.getenv("LOCAL_TMP_DIR", "/tmp")
 
 # FAISS paths (temp local)
@@ -84,15 +84,16 @@ def chunk_text(text: str, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> List[str]:
     return chunks
 
 def download_blob_to_temp(gcs_path: str) -> str:
-    """Download a GCS object to local /tmp path"""
+    """Download a GCS object to local /tmp path."""
     blob = bucket.blob(gcs_path)
     local_path = os.path.join(LOCAL_TMP_DIR, os.path.basename(gcs_path))
     os.makedirs(os.path.dirname(local_path), exist_ok=True)
     blob.download_to_filename(local_path)
+    log.info(f"Downloaded {gcs_path} → {local_path}")
     return local_path
 
 def upload_file_to_gcs(local_path: str, gcs_path: str):
-    """Upload local file to GCS under output prefix"""
+    """Upload local file to GCS under output prefix."""
     blob = bucket.blob(gcs_path)
     blob.upload_from_filename(local_path)
     log.info(f"Uploaded {local_path} → gs://{GCS_BUCKET_NAME}/{gcs_path}")
@@ -279,7 +280,7 @@ def main():
     for pdf_blob_path in pdfs:
         ingest_pdf_file(pdf_blob_path, embed_model)
 
-    log.info("All PDFs processed successfully!")
+    log.info("✅ All PDFs processed and stored successfully in MongoDB & FAISS!")
 
 if __name__ == "__main__":
     main()
