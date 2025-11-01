@@ -9,15 +9,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install deps
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
       - name: Run tests
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          API_KEY: ${{ secrets.API_KEY }}
+          MONGODB_DBNAME: gpt_integration
+          MONGODB_COLLECTION: documents
+          FAISS_PATH: ./knowledge_pack/index_hnsw.faiss
+          EMBED_MODEL_NAME: all-MiniLM-L6-v2
+          RATE_LIMIT_QUESTIONS: 100/minute
+          USE_S3: false
         run: pytest -q
