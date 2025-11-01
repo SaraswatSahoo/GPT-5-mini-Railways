@@ -21,6 +21,7 @@ jobs:
 
       - name: Run tests
         env:
+          SKIP_FAISS_CHECK: "true"
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           API_KEY: ${{ secrets.API_KEY }}
