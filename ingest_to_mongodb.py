@@ -3,7 +3,7 @@ import logging
 import json
 from io import BytesIO
 from typing import List, Dict
-
+import platform
 import fitz  # PyMuPDF
 import camelot
 from PIL import Image
@@ -20,6 +20,13 @@ from utils.logging_config import setup_logging
 
 setup_logging()
 log = logging.getLogger("ingest")
+
+# Check for optional env var specifying tesseract executable path
+if os.getenv("TESSERACT_CMD"):
+    pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_CMD")
+    log.info(f"Using Tesseract at path from TESSERACT_CMD: {pytesseract.pytesseract.tesseract_cmd}")
+else:
+    log.info(f"Using system PATH to find Tesseract (OS: {platform.system()})")
 
 # Load environment
 load_dotenv()

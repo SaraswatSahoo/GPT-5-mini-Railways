@@ -38,19 +38,35 @@ embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 FAISS_PATH = os.getenv("FAISS_PATH", "./knowledge_pack/index_hnsw.faiss")
 faiss_index = None
 faiss_id_map: Dict[int, str] = {} # Added
+FAISS_AVAILABLE = False
+
 try:
     if os.path.exists(FAISS_PATH):
         faiss_index = faiss.read_index(FAISS_PATH)
-        # Load the index mapping
         with open(FAISS_PATH + ".pkl", "rb") as f:
-            # Ingestion saves the map directly
-            faiss_id_map = pickle.load(f) 
+            faiss_id_map = pickle.load(f)
         log.info("FAISS index and map loaded successfully.")
-except Exception:
-    log.warning("Could not read FAISS index or map (maybe not built yet).")
+        FAISS_AVAILABLE = True
+except Exception as e:
+    log.warning(f"Could not read FAISS index or map: {e}")
+    FAISS_AVAILABLE = False
 
 TOP_K = 4
 IMAGE_KEYWORDS = {"image","diagram","photo","picture","figure","chart","graph","देख","तस्वीर","चित्र","कैसा"}
+
+def fallback_mongodb_search(query: str, top_k: int = TOP_K) -> List[Dict]:
+    try:
+        results = list(col.find(
+            {"$text": {"$search": query}},
+            {"score": {"$meta": "textScore"}}
+        ).sort([("score", {"$meta": "textScore"})]).limit(top_k))
+        if results:
+            return results
+        else:
+            return list(col.find().limit(top_k))
+    except Exception as e:
+        log.error(f"MongoDB fallback search failed: {e}")
+        return []
 
 def _encode(q: List[str]) -> np.ndarray:
     return embed_model.encode(q, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
@@ -70,29 +86,21 @@ def _read_image_as_dataurl(path: str) -> str:
 
 def find_relevant(query: str) -> Tuple[List[str], List[str]]:
     q_vec = _encode([query])[0]
-    
     contexts = []
     images = []
-    
-    # --- 1. FAISS Search (Primary Retrieval) ---
-    if faiss_index is not None and faiss_index.ntotal > 0:
-        try:
-            D, I = faiss_index.search(np.expand_dims(q_vec, 0), TOP_K * 2) # Search for more, then filter
-            
-            # Map FAISS IDs back to MongoDB doc_ids
-            mongo_doc_ids = [faiss_id_map[idx] for idx in I[0] if idx in faiss_id_map]
-            
-            # Retrieve documents from MongoDB using doc_ids
-            # Use $in for bulk retrieval based on the list of doc_ids
-            hits = list(col.find({"doc_id": {"$in": mongo_doc_ids}}))
-            log.info("Retrieved %d documents from FAISS search.", len(hits))
 
-        except Exception:
-            log.exception("FAISS search or document retrieval failed. Falling back to Atlas search if available.")
-            hits = []
+    if FAISS_AVAILABLE and faiss_index is not None and faiss_index.ntotal > 0:
+        try:
+            D, I = faiss_index.search(np.expand_dims(q_vec, 0), TOP_K * 2)
+            mongo_doc_ids = [faiss_id_map[idx] for idx in I[0] if idx in faiss_id_map]
+            hits = list(col.find({"doc_id": {"$in": mongo_doc_ids}}))
+            log.info(f"Retrieved {len(hits)} documents from FAISS search.")
+        except Exception as e:
+            log.exception(f"FAISS search failed: {e}. Falling back to MongoDB.")
+            hits = fallback_mongodb_search(query)
     else:
-        log.info("Local FAISS index not available or empty.")
-        hits = []
+        log.info("Local FAISS index not available or empty. Using fallback search.")
+        hits = fallback_mongodb_search(query)
 
     # --- 2. Process Hits ---
     # The Atlas vector search is removed here to simplify and rely on the local FAISS index as intended.
