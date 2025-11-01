@@ -90,4 +90,3 @@ async def query_documents(request: QueryRequest):
     Placeholder/removed RAG logic. Use server.py for /ask.
     """
     return {"query": request.query, "answer": "Use the /ask endpoint on the main server."}
-

@@ -1,168 +1,152 @@
 import os
-import json
-import faiss
+import base64
+import logging
+from typing import List, Dict, Any, Tuple
 import numpy as np
-from dotenv import load_dotenv
 from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer
-from openai import OpenAI
-from google.cloud import storage
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+import openai
+import faiss
+import pickle # Added
 
-# Load environment variables
+from utils.logging_config import setup_logging
+
+setup_logging()
+log = logging.getLogger("retrieve")
+
 load_dotenv()
-
-# Initialize FastAPI app
-app = FastAPI(title="GPT-5 Mini Railway RAG API", description="Retrieval-Augmented Generation Server", version="1.0")
-
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# MongoDB setup
 MONGO_URI = os.getenv("MONGODB_URI")
-MONGO_DBNAME = os.getenv("MONGODB_DBNAME", "gpt_integration")
-MONGO_COLLECTION = os.getenv("MONGODB_COLLECTION", "documents")
+DB_NAME = os.getenv("MONGODB_DBNAME", "gpt_integration")
+COLLECTION_NAME = os.getenv("MONGODB_COLLECTION", "documents")
 
-mongo_client = MongoClient(MONGO_URI)
-db = mongo_client[MONGO_DBNAME]
-collection = db[MONGO_COLLECTION]
+if not MONGO_URI:
+    raise RuntimeError("MONGODB_URI not set")
 
-# Embedding model
-embed_model = SentenceTransformer(os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"))
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+col = db[COLLECTION_NAME]
 
-# FAISS index setup (optional fallback)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY not set")
+openai.api_key = OPENAI_API_KEY
+
+EMBED_MODEL_NAME = "all-MiniLM-L6-v2" # Standardized model
+embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+
 FAISS_PATH = os.getenv("FAISS_PATH", "./knowledge_pack/index_hnsw.faiss")
-index = None
-if os.path.exists(FAISS_PATH):
-    index = faiss.read_index(FAISS_PATH)
+faiss_index = None
+faiss_id_map: Dict[int, str] = {} # Added
+try:
+    if os.path.exists(FAISS_PATH):
+        faiss_index = faiss.read_index(FAISS_PATH)
+        # Load the index mapping
+        with open(FAISS_PATH + ".pkl", "rb") as f:
+            # Ingestion saves the map directly
+            faiss_id_map = pickle.load(f) 
+        log.info("FAISS index and map loaded successfully.")
+except Exception:
+    log.warning("Could not read FAISS index or map (maybe not built yet).")
 
-# GCS setup
-storage_client = None
-if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-    storage_client = storage.Client.from_service_account_json(os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
-    bucket_name = os.getenv("GCS_BUCKET_NAME")
-else:
-    print("⚠️ Google Cloud credentials not found. Skipping GCS setup.")
+TOP_K = 4
+IMAGE_KEYWORDS = {"image","diagram","photo","picture","figure","chart","graph","देख","तस्वीर","चित्र","कैसा"}
 
+def _encode(q: List[str]) -> np.ndarray:
+    return embed_model.encode(q, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
 
-# ---------------------- Helper Functions ----------------------
+def _get_docs_by_ids(ids: List[int]) -> List[Dict]:
+    # FAISS indices don't map directly to Mongo IDs unless we store mapping; fallback to text-match search
+    # We'll fetch best matches from Atlas as fallback
+    return []
 
-def get_top_documents(query, top_k=3):
-    """Retrieve top relevant documents from MongoDB using vector similarity."""
-    query_embedding = embed_model.encode([query])[0].tolist()
-
-    # Retrieve all stored embeddings from MongoDB
-    docs = list(collection.find({}, {"text": 1, "embedding": 1, "source": 1}))
-    if not docs:
-        return []
-
-    embeddings = np.array([d["embedding"] for d in docs])
-    query_vec = np.array(query_embedding)
-
-    # Compute cosine similarity
-    similarity = np.dot(embeddings, query_vec) / (
-        np.linalg.norm(embeddings, axis=1) * np.linalg.norm(query_vec)
-    )
-
-    top_indices = similarity.argsort()[-top_k:][::-1]
-    top_docs = [docs[i] for i in top_indices]
-    return top_docs
-
-
-def construct_prompt(contexts, question):
-    """Constructs the final prompt for OpenAI."""
-    combined_context = "\n\n".join(
-        [f"Source: {doc.get('source', 'Unknown')}\nContent: {doc['text']}" for doc in contexts]
-    )
-    prompt = f"""You are a helpful assistant for answering queries about railway information.
-
-Use the following retrieved context to answer the question concisely and accurately.
-
-Context:
-{combined_context}
-
-Question: {question}
-
-Answer:"""
-    return prompt
-
-
-def call_openai(prompt):
-    """Call OpenAI model to generate an answer."""
+def _read_image_as_dataurl(path: str) -> str:
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a knowledgeable assistant for Indian Railways data."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=500,
+        with open(path, "rb") as f:
+            b = f.read()
+            return "data:image/jpeg;base64," + base64.b64encode(b).decode("utf-8")
+    except Exception:
+        return ""
+
+def find_relevant(query: str) -> Tuple[List[str], List[str]]:
+    q_vec = _encode([query])[0]
+    
+    contexts = []
+    images = []
+    
+    # --- 1. FAISS Search (Primary Retrieval) ---
+    if faiss_index is not None and faiss_index.ntotal > 0:
+        try:
+            D, I = faiss_index.search(np.expand_dims(q_vec, 0), TOP_K * 2) # Search for more, then filter
+            
+            # Map FAISS IDs back to MongoDB doc_ids
+            mongo_doc_ids = [faiss_id_map[idx] for idx in I[0] if idx in faiss_id_map]
+            
+            # Retrieve documents from MongoDB using doc_ids
+            # Use $in for bulk retrieval based on the list of doc_ids
+            hits = list(col.find({"doc_id": {"$in": mongo_doc_ids}}))
+            log.info("Retrieved %d documents from FAISS search.", len(hits))
+
+        except Exception:
+            log.exception("FAISS search or document retrieval failed. Falling back to Atlas search if available.")
+            hits = []
+    else:
+        log.info("Local FAISS index not available or empty.")
+        hits = []
+
+    # --- 2. Process Hits ---
+    # The Atlas vector search is removed here to simplify and rely on the local FAISS index as intended.
+    # If Atlas search is desired, it should be re-introduced with proper configuration.
+    
+    # Process the hits from FAISS/Mongo retrieval
+    for h in hits:
+        txt = h.get("text_for_search") or h.get("text") or h.get("ocr_text") or ""
+        if txt and len(contexts) < TOP_K:
+            contexts.append(txt[:1200]) # Truncate context
+        
+        # Images are also handled here if they were retrieved
+        if h.get("type") == "image" and h.get("image_path") and len(images) < TOP_K:
+            # Image path is relative to the `ingest_to_mongodb.py` execution environment
+            full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", h["image_path"].lstrip("./"))
+            data_url = _read_image_as_dataurl(full_path)
+            if data_url:
+                images.append(data_url)
+    
+    # Dedupe contexts (optional, but good practice)
+    out_contexts = []
+    seen_contexts = set()
+    for c in contexts:
+        if c not in seen_contexts:
+            seen_contexts.add(c)
+            out_contexts.append(c)
+    
+    return out_contexts[:TOP_K], images[:TOP_K]
+
+def build_prompt(contexts: List[str], query: str) -> str:
+    context_text = "\n\n".join(contexts) if contexts else ""
+    return (
+        "You are a helpful assistant. If the user uses Hindi, answer in Hindi; if they use English, answer in English.\n"
+        "Use only the provided context to answer. If you do not have enough information, say so concisely.\n\n"
+        f"Context:\n{context_text}\n\nQuestion: {query}\nAnswer:"
+    )
+
+def generate_answer(prompt: str) -> str:
+    try:
+        # Changed to a real, available model
+        resp = openai.chat.completions.create(
+            model="gpt-3.5-turbo", # Changed from gpt-5-mini
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.2
         )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"OpenAI API error: {e}")
-        return "Sorry, I encountered an issue while generating a response."
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        log.exception("GPT call failed")
+        return "I encountered an error while generating the answer."
 
-
-# ---------------------- FastAPI Routes ----------------------
-
-@app.get("/ping")
-def ping():
-    return {"status": "ok", "message": "Server is running successfully."}
-
-
-@app.get("/retrieve_and_answer")
-def retrieve_and_answer(question: str = Query(..., description="User's query text")):
-    if not question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    top_docs = get_top_documents(question, top_k=3)
-    if not top_docs:
-        raise HTTPException(status_code=404, detail="No relevant documents found in the database.")
-
-    prompt = construct_prompt(top_docs, question)
-    answer = call_openai(prompt)
-
-    return {
-        "question": question,
-        "answer": answer,
-        "sources": [d.get("source", "Unknown") for d in top_docs],
-    }
-
-
-@app.get("/list_gcs_pdfs")
-def list_gcs_pdfs():
-    """List available PDFs in the GCS bucket."""
-    if not storage_client:
-        raise HTTPException(status_code=500, detail="GCS not configured.")
-
-    try:
-        bucket = storage_client.bucket(bucket_name)
-        blobs = bucket.list_blobs(prefix="pdfs/")
-        pdf_files = [blob.name for blob in blobs if blob.name.lower().endswith(".pdf")]
-        return {"pdfs": pdf_files}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to list PDFs: {e}")
-
-
-# ---------------------- Main ----------------------
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "retrieve_and_answer:app",
-        host=os.getenv("HOST", "0.0.0.0"),
-        port=int(os.getenv("PORT", 8000)),
-        log_level=os.getenv("LOG_LEVEL", "info").lower(),
-    )
+def answer(question: str) -> Dict[str,Any]:
+    if not question or not question.strip():
+        return {"answer":"Please ask a non-empty question.", "images":[], "contexts":[]}
+    contexts, images = find_relevant(question)
+    prompt = build_prompt(contexts, question)
+    text = generate_answer(prompt)
+    return {"answer": text, "images": images, "contexts": contexts}
