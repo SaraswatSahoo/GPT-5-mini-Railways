@@ -7,6 +7,10 @@ function App() {
   const [loading, setLoading] = useState(false);
   const recognitionRef = useRef(null);
 
+  // ✅ Use Vite environment variables
+  const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+  const API_KEY = import.meta.env.VITE_API_KEY;
+
   // 🎤 Speech to text setup
   const handleMic = () => {
     if (!("webkitSpeechRecognition" in window)) {
@@ -36,15 +40,14 @@ function App() {
     setLoading(true);
 
     try {
-      // Changed to use the /ask endpoint defined in server.py
-      const res = await fetch("http://127.0.0.1:8000/ask", { 
+      const headers = { "Content-Type": "application/json" };
+      if (API_KEY) headers["Authorization"] = `Bearer ${API_KEY}`; // ✅ use your API key header
+
+      const res = await fetch(`${API_URL}/ask`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question: question,   // must be "question" for /ask endpoint
-          top_k: 5            
-        })
-      })
+        headers,
+        body: JSON.stringify({ question: question, top_k: 5 }),
+      });
 
       const data = await res.json();
 
